@@ -30,9 +30,16 @@ Sleep 400ms
 Down
 Sleep 3s
 
+Type "s"
+Sleep 3.5s
+Type "s"
+Sleep 1s
+
 Type "v"
-Sleep 2.5s
-Type "v"
+Sleep 2s
+Type "-"
+Sleep 1.5s
+Type "="
 Sleep 2s
 Type "v"
 Sleep 1s
@@ -48,6 +55,11 @@ Type "2"
 Sleep 2s
 Down
 Sleep 2s
+
+Type "?"
+Sleep 2.5s
+Escape
+Sleep 500ms
 
 Type "1"
 Type "F"

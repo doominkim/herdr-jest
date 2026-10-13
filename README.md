@@ -10,13 +10,13 @@
   </p>
 </div>
 
-<p align="center"><img src="docs/demo/demo.gif" width="960" alt="Running all tests, reading a failure, switching between tree, folder and file views, rerunning one test, and filtering to failed tests"></p>
+<p align="center"><img src="docs/demo/demo.gif" width="960" alt="Running all tests, reading a failure and its source line, switching to the folder view and collapsing it, rerunning one test, browsing history and keybindings, and filtering to failed tests"></p>
 
 > **In development.** Expect rough edges and breaking changes before 1.0.
 
 ## See every test at a glance.
 
-Open the popup and your spec files appear with ✓ ✗ ○ from the last run. Switch between three views: a file › describe › test tree, the same tree grouped by folder, or a flat list of files. `it.each` tables and `.only` / `.skip` variants are recognized.
+Open the popup and your spec files appear with ✓ ✗ ○ from the last run. Switch between two views: a file › describe › test tree, or the same tree grouped by folder. Press `=` to expand everything and `-` to collapse it. `it.each` tables and `.only` / `.skip` variants are recognized.
 
 ## Run exactly what you need.
 
@@ -28,7 +28,7 @@ The History panel expands when you focus it and lists recent runs with the branc
 
 ## Read failures in place.
 
-Expected and received values are highlighted, and framework stack frames are hidden.
+Expected and received values are highlighted, and framework stack frames are hidden. Press `s` to read the test file itself: the selected test is marked and each failure appears under the line that threw it.
 
 ## Install
 
@@ -53,16 +53,19 @@ description = "Open herdr-jest"
 | Key | Action |
 |---|---|
 | `1` `2` `3` `Tab` | Focus Tests, History, or Details |
-| `j` `k` | Move, or scroll in Details |
+| `↑` `↓` | Move, or scroll in Details |
 | `l` `h` | Expand and step into children / collapse or go to parent |
 | `Enter` | Run the selection (in History: rerun that scope) |
 | `a` | Run all tests |
 | `f` | Rerun failed tests |
-| `v` | Switch view: tree, folders, files |
+| `v` | Switch view: tree, folders |
+| `=` `-` | Expand all / collapse all |
+| `s` | Switch Details between the result and the test file source (or `←` `→` while Details is focused) |
 | `F` | Show failed tests only |
 | `/` | Search by name |
 | `Ctrl+d` `Ctrl+u` | Scroll the detail pane |
 | `X` | Stop the background process |
+| `?` | Show keybindings for the focused panel; pick one and press `Enter` to run it |
 | `q` `Esc` `F2` | Close |
 
 The mouse works too: click a panel or row to select it, click `▸` / `▾` to expand or collapse, double-click to run, scroll with the wheel, and click any key hint in the bottom bar.

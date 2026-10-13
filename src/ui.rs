@@ -3,12 +3,13 @@ use crate::discover::NodeKind;
 use crate::paths;
 use crate::protocol::{FileView, NodeView, Request, RunRecord, Snapshot};
 use crate::results::{Assertion, Status};
+use crate::source::{self, Token};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
 struct Row {
@@ -56,21 +57,80 @@ enum Focus {
     Details,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailTab {
+    Result,
+    Source,
+}
+
+struct SourceCache {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    lines: Vec<Vec<(Token, String)>>,
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    keys: &'static str,
+    action: &'static str,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+const fn bind(keys: &'static str, action: &'static str, code: KeyCode) -> Binding {
+    Binding { keys, action, code, modifiers: KeyModifiers::NONE }
+}
+
+const TESTS_KEYS: [Binding; 9] = [
+    bind("⏎", "Run the selection", KeyCode::Enter),
+    bind("l →", "Expand / step into children", KeyCode::Char('l')),
+    bind("h ←", "Collapse / go to parent", KeyCode::Char('h')),
+    bind("↑ ↓", "Move", KeyCode::Down),
+    bind("v", "Switch view: tree, folders", KeyCode::Char('v')),
+    bind("=", "Expand all", KeyCode::Char('=')),
+    bind("-", "Collapse all", KeyCode::Char('-')),
+    bind("F", "Show failed tests only", KeyCode::Char('F')),
+    bind("/", "Search by name", KeyCode::Char('/')),
+];
+
+const HISTORY_KEYS: [Binding; 2] =
+    [bind("⏎", "Run the same scope again", KeyCode::Enter), bind("↑ ↓", "Select a run", KeyCode::Down)];
+
+const DETAILS_KEYS: [Binding; 5] = [
+    bind("←", "Show the result", KeyCode::Left),
+    bind("→", "Show the source", KeyCode::Right),
+    bind("↑ ↓", "Scroll", KeyCode::Down),
+    Binding { keys: "^d", action: "Page down", code: KeyCode::Char('d'), modifiers: KeyModifiers::CONTROL },
+    Binding { keys: "^u", action: "Page up", code: KeyCode::Char('u'), modifiers: KeyModifiers::CONTROL },
+];
+
+const GLOBAL_KEYS: [Binding; 10] = [
+    bind("a", "Run all tests", KeyCode::Char('a')),
+    bind("f", "Rerun failed tests", KeyCode::Char('f')),
+    bind("s", "Switch Details: result, source", KeyCode::Char('s')),
+    bind("1", "Focus Tests", KeyCode::Char('1')),
+    bind("2", "Focus History", KeyCode::Char('2')),
+    bind("3", "Focus Details", KeyCode::Char('3')),
+    bind("Tab", "Focus the next panel", KeyCode::Tab),
+    bind("X", "Stop the background process", KeyCode::Char('X')),
+    bind("q", "Close", KeyCode::Char('q')),
+    bind("?", "Keybindings", KeyCode::Char('?')),
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ViewMode {
     #[default]
+    #[serde(alias = "files")]
     Tree,
     Folders,
-    Files,
 }
 
 impl ViewMode {
     fn next(self) -> ViewMode {
         match self {
             ViewMode::Tree => ViewMode::Folders,
-            ViewMode::Folders => ViewMode::Files,
-            ViewMode::Files => ViewMode::Tree,
+            ViewMode::Folders => ViewMode::Tree,
         }
     }
 
@@ -78,7 +138,6 @@ impl ViewMode {
         match self {
             ViewMode::Tree => "tree",
             ViewMode::Folders => "folders",
-            ViewMode::Files => "files",
         }
     }
 }
@@ -120,12 +179,18 @@ struct App {
     history_area: Rect,
     detail_area: Rect,
     last_click: Option<(Instant, Focus, usize)>,
+    help: Option<ListState>,
+    help_area: Rect,
+    detail_tab: DetailTab,
+    source_anchor: Option<String>,
+    source_cache: Option<SourceCache>,
 }
 
 #[derive(Clone, Copy)]
 enum ClickAction {
     Url(&'static str),
     Key(KeyCode),
+    Tab(DetailTab),
 }
 
 struct ClickTarget {
@@ -188,6 +253,11 @@ pub fn run(cwd: &Path) -> std::io::Result<()> {
         history_area: Rect::default(),
         detail_area: Rect::default(),
         last_click: None,
+        help: None,
+        help_area: Rect::default(),
+        detail_tab: DetailTab::Result,
+        source_anchor: None,
+        source_cache: None,
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
@@ -231,6 +301,18 @@ impl App {
             }
             let key = match event::read()? {
                 Event::Key(key) => key,
+                Event::Mouse(mouse) if self.help.is_some() => {
+                    let keep_going = match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => self.on_help_click(mouse.column, mouse.row, &rows),
+                        MouseEventKind::ScrollDown => self.on_help_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &rows),
+                        MouseEventKind::ScrollUp => self.on_help_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &rows),
+                        _ => true,
+                    };
+                    if !keep_going {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 Event::Mouse(mouse) => {
                     let keep_going = match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => self.on_click(mouse.column, mouse.row, &rows),
@@ -250,6 +332,12 @@ impl App {
             }
             if self.searching {
                 self.on_search_key(key);
+                continue;
+            }
+            if self.help.is_some() {
+                if !self.on_help_key(key, &rows) {
+                    return Ok(());
+                }
                 continue;
             }
             if !self.on_key(key, &rows) {
@@ -278,6 +366,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::F(2) => return false,
+            KeyCode::Char('?') => self.help = Some(ListState::default().with_selected(Some(0))),
             KeyCode::Char('d') if ctrl => self.detail_scroll = self.detail_scroll.saturating_add(10),
             KeyCode::Char('u') if ctrl => self.detail_scroll = self.detail_scroll.saturating_sub(10),
             KeyCode::Char('1') => self.focus = Focus::Tests,
@@ -292,6 +381,10 @@ impl App {
                 self.set_focus(next);
             }
             KeyCode::Char('a') => self.send(Request::Run { scope: Scope::All }),
+            KeyCode::Char('s') => {
+                let next = if self.detail_tab == DetailTab::Result { DetailTab::Source } else { DetailTab::Result };
+                self.set_detail_tab(next);
+            }
             KeyCode::Char('f') => self.send(Request::RunFailed),
             KeyCode::Char('F') => {
                 self.focus = Focus::Tests;
@@ -319,6 +412,212 @@ impl App {
             },
         }
         true
+    }
+
+    fn on_help_key(&mut self, key: KeyEvent, rows: &[Row]) -> bool {
+        let len = self.help_bindings().len();
+        let selected = self.help.as_ref().and_then(ListState::selected).unwrap_or(0);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?') => self.help = None,
+            KeyCode::F(2) => return false,
+            KeyCode::Char('j') | KeyCode::Down => self.select_help((selected + 1).min(len - 1)),
+            KeyCode::Char('k') | KeyCode::Up => self.select_help(selected.saturating_sub(1)),
+            KeyCode::Enter => return self.run_help_binding(selected, rows),
+            _ => {
+                self.help = None;
+                return self.on_key(key, rows);
+            }
+        }
+        true
+    }
+
+    fn select_help(&mut self, index: usize) {
+        if let Some(help) = self.help.as_mut() {
+            help.select(Some(index));
+        }
+    }
+
+    fn run_help_binding(&mut self, index: usize, rows: &[Row]) -> bool {
+        self.help = None;
+        let Some(binding) = self.help_bindings().get(index).copied() else {
+            return true;
+        };
+        self.on_key(KeyEvent::new(binding.code, binding.modifiers), rows)
+    }
+
+    fn help_sections(&self) -> [(&'static str, &'static [Binding]); 2] {
+        let local: (&'static str, &'static [Binding]) = match self.focus {
+            Focus::Tests => ("Tests", &TESTS_KEYS),
+            Focus::History => ("History", &HISTORY_KEYS),
+            Focus::Details => ("Details", &DETAILS_KEYS),
+        };
+        [local, ("Global", &GLOBAL_KEYS)]
+    }
+
+    fn help_bindings(&self) -> Vec<Binding> {
+        self.help_sections().iter().flat_map(|(_, bindings)| bindings.iter().copied()).collect()
+    }
+
+    fn help_binding_at(&self, item: usize) -> Option<usize> {
+        let mut first_item = 0;
+        let mut first_binding = 0;
+        for (_, bindings) in self.help_sections() {
+            let start = first_item + 1;
+            if (start..start + bindings.len()).contains(&item) {
+                return Some(first_binding + item - start);
+            }
+            first_item = start + bindings.len() + 1;
+            first_binding += bindings.len();
+        }
+        None
+    }
+
+    fn draw_help(&mut self, frame: &mut Frame) {
+        let Some(mut state) = self.help.take() else {
+            return;
+        };
+        let mut items = Vec::new();
+        let mut binding_items = Vec::new();
+        for (index, (title, bindings)) in self.help_sections().into_iter().enumerate() {
+            if index > 0 {
+                items.push(ListItem::new(Line::raw("")));
+            }
+            items.push(ListItem::new(Line::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+            for binding in bindings {
+                binding_items.push(items.len());
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<6}", binding.keys), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::raw(binding.action),
+                ])));
+            }
+        }
+        let selected = state.selected().unwrap_or(0).min(binding_items.len() - 1);
+        state.select(Some(selected));
+        let mut list_state = ListState::default().with_selected(Some(binding_items[selected])).with_offset(state.offset());
+
+        let screen = frame.area();
+        let width = 52.min(screen.width.saturating_sub(4));
+        let height = (items.len() as u16 + 2).min(screen.height.saturating_sub(4));
+        let area = Rect::new(
+            screen.x + (screen.width - width) / 2,
+            screen.y + (screen.height - height) / 2,
+            width,
+            height,
+        );
+        self.help_area = area;
+        let block = panel(Line::raw(" Keybindings "), true).title_bottom(position(Some(selected), binding_items.len()));
+        let list = List::new(items)
+            .block(block)
+            .highlight_symbol(Span::styled("▌", Style::default().fg(ACCENT)))
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD));
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(list, area, &mut list_state);
+        *state.offset_mut() = list_state.offset();
+        self.help = Some(state);
+    }
+
+    fn on_help_click(&mut self, column: u16, y: u16, rows: &[Row]) -> bool {
+        if !self.help_area.contains(Position::new(column, y)) {
+            self.help = None;
+            return true;
+        }
+        let offset = self.help.as_ref().map_or(0, ListState::offset);
+        match list_index(self.help_area, y, offset).and_then(|item| self.help_binding_at(item)) {
+            Some(index) => self.run_help_binding(index, rows),
+            None => true,
+        }
+    }
+
+    fn set_detail_tab(&mut self, tab: DetailTab) {
+        if self.focus == Focus::History {
+            self.focus = Focus::Tests;
+        }
+        if tab == self.detail_tab {
+            return;
+        }
+        self.detail_tab = tab;
+        self.detail_scroll = 0;
+        self.source_anchor = None;
+    }
+
+    fn source_lines(&mut self, path: &Path) -> Option<&[Vec<(Token, String)>]> {
+        let modified = std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
+        let fresh = self.source_cache.as_ref().is_some_and(|cache| cache.path == path && cache.modified == modified);
+        if !fresh {
+            let text = std::fs::read_to_string(path).ok()?;
+            self.source_cache = Some(SourceCache { path: path.to_path_buf(), modified, lines: source::highlight(&text) });
+        }
+        self.source_cache.as_ref().map(|cache| cache.lines.as_slice())
+    }
+
+    fn source_text(&mut self, row: Option<&Row>) -> (Text<'static>, u16) {
+        let Some(row) = row.filter(|row| row.kind != RowKind::Folder) else {
+            return (Text::styled("Select a file or test to see its source", Style::default().fg(DIM)), 0);
+        };
+        let file = self.snapshot.files.iter().find(|file| file.path == row.file);
+        let range = file
+            .and_then(|file| node_at(&file.nodes, &row.node_path))
+            .filter(|_| row.kind != RowKind::File)
+            .map(|node| node.line as usize..=node.end_line.max(node.line) as usize);
+        let mut failures: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+        if let Some(file) = file {
+            let mut assertions = Vec::new();
+            for node in &file.nodes {
+                collect_assertions(node, &mut assertions);
+            }
+            assertions.extend(file.unmatched.iter().cloned());
+            for assertion in assertions.iter().filter(|assertion| assertion.status == Status::Failed) {
+                for message in &assertion.failure_messages {
+                    if let Some(line) = source::failure_line(message, &row.file) {
+                        failures.entry(line).or_insert_with(|| error_summary(message));
+                    }
+                }
+            }
+        }
+        let path = row.file.clone();
+        let Some(source) = self.source_lines(&path) else {
+            return (Text::styled(format!("Cannot read {}", path.display()), Style::default().fg(Color::Red)), 0);
+        };
+        let width = source.len().to_string().len();
+        let mut lines = Vec::new();
+        let mut anchor = None;
+        for (index, spans) in source.iter().enumerate() {
+            let number = index + 1;
+            let in_range = range.as_ref().is_some_and(|range| range.contains(&number));
+            let failure = failures.get(&number);
+            if anchor.is_none() && (range.as_ref().is_some_and(|range| *range.start() == number) || (range.is_none() && failure.is_some())) {
+                anchor = Some(lines.len());
+            }
+            let bar = if in_range { Span::styled("▌", Style::default().fg(ACCENT)) } else { Span::raw(" ") };
+            let number_style = if failure.is_some() {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if in_range {
+                Style::default().fg(ACCENT)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let mut line = vec![bar, Span::styled(format!("{number:>width$} "), number_style)];
+            line.extend(spans.iter().map(|(token, text)| Span::styled(text.replace('\t', "  "), token_style(*token))));
+            lines.push(Line::from(line));
+            for (offset, message) in failure.into_iter().flatten().enumerate() {
+                let marker = if offset == 0 { "✗ " } else { "│ " };
+                let style = if message.starts_with("Expected") || message.starts_with("- ") {
+                    Style::default().fg(Color::Green)
+                } else if message.starts_with("Received") || message.starts_with("+ ") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(width + 2)),
+                    Span::styled(marker, Style::default().fg(Color::Red)),
+                    Span::styled(message.clone(), style),
+                ]));
+            }
+        }
+        let scroll = anchor.unwrap_or(0).saturating_sub(2) as u16;
+        (Text::from(lines), scroll)
     }
 
     fn set_focus(&mut self, focus: Focus) {
@@ -351,6 +650,8 @@ impl App {
 
     fn on_details_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('h') | KeyCode::Left => self.set_detail_tab(DetailTab::Result),
+            KeyCode::Char('l') | KeyCode::Right => self.set_detail_tab(DetailTab::Source),
             KeyCode::Char('j') | KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
             KeyCode::Char('k') | KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
             _ => {}
@@ -373,6 +674,8 @@ impl App {
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(selected, rows),
+            KeyCode::Char('=') => self.set_all_open(true, row),
+            KeyCode::Char('-') => self.set_all_open(false, row),
             KeyCode::Enter => {
                 if let Some(row) = row {
                     self.send(Request::Run { scope: scope_for(row) });
@@ -439,6 +742,31 @@ impl App {
         }
     }
 
+    fn set_all_open(&mut self, open: bool, selected: Option<&Row>) {
+        self.expanded.clear();
+        self.collapsed_folders.clear();
+        if open {
+            for file in &self.snapshot.files {
+                let file_key = file.path.display().to_string();
+                expand_nodes(&mut self.expanded, &file_key, &file.nodes);
+                self.expanded.insert(file_key);
+            }
+        } else if self.mode == ViewMode::Folders {
+            self.collapsed_folders = self.rows().into_iter().filter(|row| row.kind == RowKind::Folder).map(|row| row.key).collect();
+        }
+        let Some(selected) = selected else {
+            return;
+        };
+        let rows = self.rows();
+        let index = rows
+            .iter()
+            .position(|row| row.key == selected.key)
+            .or_else(|| rows.iter().position(|row| row.kind == RowKind::File && row.file == selected.file))
+            .or_else(|| rows.iter().rposition(|row| row.kind == RowKind::Folder && selected.file.starts_with(&row.file)))
+            .unwrap_or(0);
+        self.list.select(Some(index));
+    }
+
     fn expand_failed(&mut self) {
         for file in &self.snapshot.files {
             let file_key = file.path.display().to_string();
@@ -451,8 +779,7 @@ impl App {
 
     fn rows(&self) -> Vec<Row> {
         match self.mode {
-            ViewMode::Tree => self.snapshot.files.iter().filter_map(|file| self.file_rows(file, 0, true, true)).flatten().collect(),
-            ViewMode::Files => self.snapshot.files.iter().filter_map(|file| self.file_rows(file, 0, true, false)).flatten().collect(),
+            ViewMode::Tree => self.snapshot.files.iter().filter_map(|file| self.file_rows(file, 0, true)).flatten().collect(),
             ViewMode::Folders => {
                 let mut root = DirNode::default();
                 for file in &self.snapshot.files {
@@ -489,10 +816,12 @@ impl App {
             if children.is_empty() {
                 continue;
             }
-            let files: Vec<PathBuf> = children
-                .iter()
-                .filter(|row| row.kind == RowKind::File)
-                .map(|row| row.file.clone())
+            let mut nested = Vec::new();
+            collect_dir_files(node, &mut nested);
+            let files: Vec<PathBuf> = nested
+                .into_iter()
+                .filter(|file| self.file_rows(file, 0, false).is_some())
+                .map(|file| file.path.clone())
                 .collect();
             let file_views: Vec<&FileView> =
                 self.snapshot.files.iter().filter(|file| files.contains(&file.path)).collect();
@@ -526,13 +855,13 @@ impl App {
             }
         }
         for file in &dir.files {
-            if let Some(rows) = self.file_rows(file, depth, false, true) {
+            if let Some(rows) = self.file_rows(file, depth, false) {
                 out.extend(rows);
             }
         }
     }
 
-    fn file_rows(&self, file: &FileView, depth: usize, show_dir: bool, with_children: bool) -> Option<Vec<Row>> {
+    fn file_rows(&self, file: &FileView, depth: usize, show_dir: bool) -> Option<Vec<Row>> {
         if self.failed_only && file.status != Status::Failed {
             return None;
         }
@@ -541,7 +870,7 @@ impl App {
         let file_matches = query.is_empty() || relative.to_lowercase().contains(&query);
         let key = file.path.display().to_string();
         let forced_open = !query.is_empty() && !file_matches;
-        let open = with_children && (self.expanded.contains(&key) || forced_open);
+        let open = self.expanded.contains(&key) || forced_open;
         let mut children = Vec::new();
         let any_child = self.node_rows(file, &file.nodes, &key, &[], depth, open, file_matches, &mut children);
         if !file_matches && !any_child {
@@ -558,7 +887,7 @@ impl App {
             full_name: String::new(),
             node_path: Vec::new(),
             dynamic: false,
-            has_children: with_children && !file.nodes.is_empty(),
+            has_children: !file.nodes.is_empty(),
             counts: counts(&file.nodes),
             duration_ms: None,
             indent: depth,
@@ -710,15 +1039,42 @@ impl App {
         }
 
         let selected = self.list.selected().and_then(|index| rows.get(index));
-        let (detail_title, detail_text) = match self.selected_run() {
-            Some(run) if history_focused => (format!("run · {}", local_time(run.finished_at)), run_detail(run)),
-            _ => (self.detail_title(selected), self.detail_text(selected)),
+        let mut tab_targets = Vec::new();
+        let details_focused = self.focus == Focus::Details;
+        let detail_block = move |title: Line<'static>| panel(title, details_focused);
+        let detail = match self.selected_run() {
+            Some(run) if history_focused => Paragraph::new(run_detail(run))
+                .block(detail_block(Line::raw(format!(" [3] run · {} ", local_time(run.finished_at)))))
+                .wrap(Wrap { trim: false }),
+            _ => {
+                let active_tab = self.detail_tab;
+                let tab_style = move |tab: DetailTab| {
+                    if active_tab == tab { Style::default().fg(ACCENT) } else { Style::default().fg(DIM).remove_modifier(Modifier::BOLD) }
+                };
+                let tabs_start = detail_area.x + 1 + " [3] ".width() as u16;
+                tab_targets.push((tabs_start, tabs_start + 6, DetailTab::Result));
+                tab_targets.push((tabs_start + 9, tabs_start + 15, DetailTab::Source));
+                let title = Line::from(vec![
+                    Span::raw(" [3] "),
+                    Span::styled("Result", tab_style(DetailTab::Result)),
+                    Span::styled(" - ", Style::default().fg(DIM)),
+                    Span::styled("Source", tab_style(DetailTab::Source)),
+                    Span::styled(format!(" · {} ", self.detail_title(selected)), Style::default().fg(DIM)),
+                ]);
+                if self.detail_tab == DetailTab::Source {
+                    let (text, anchor) = self.source_text(selected);
+                    let key = selected.map(|row| row.key.clone()).unwrap_or_default();
+                    if self.source_anchor.as_ref() != Some(&key) {
+                        self.detail_scroll = anchor;
+                        self.source_anchor = Some(key);
+                    }
+                    Paragraph::new(text).block(detail_block(title))
+                } else {
+                    Paragraph::new(self.detail_text(selected)).block(detail_block(title)).wrap(Wrap { trim: false })
+                }
+            }
         };
-        let detail = Paragraph::new(detail_text)
-            .block(panel(Line::raw(format!(" [3] {detail_title} ")), self.focus == Focus::Details))
-            .wrap(Wrap { trim: false })
-            .scroll((self.detail_scroll, 0));
-        frame.render_widget(detail, detail_area);
+        frame.render_widget(detail.scroll((self.detail_scroll, 0)), detail_area);
 
         if let Some(error) = error {
             frame.render_widget(
@@ -730,8 +1086,10 @@ impl App {
         self.targets = targets
             .into_iter()
             .map(|(start, end, action)| ClickTarget { y: footer.y, start: footer.x + start, end: footer.x + end, action })
+            .chain(tab_targets.into_iter().map(|(start, end, tab)| ClickTarget { y: detail_area.y, start, end, action: ClickAction::Tab(tab) }))
             .collect();
         frame.render_widget(Paragraph::new(footer_line), footer);
+        self.draw_help(frame);
     }
 
     fn header_line(&self, width: u16) -> Line<'static> {
@@ -969,6 +1327,10 @@ impl App {
                 return true;
             }
             Some(ClickAction::Key(code)) => return self.on_key(KeyEvent::new(code, KeyModifiers::NONE), rows),
+            Some(ClickAction::Tab(tab)) => {
+                self.set_detail_tab(tab);
+                return true;
+            }
             None => {}
         }
 
@@ -1049,21 +1411,10 @@ impl App {
         let mut targets = Vec::new();
         let mut cursor: u16 = 0;
         let hints: &[(&str, &str)] = match self.focus {
-            Focus::Tests => &[("1-3", "panel"), ("⏎", "run"), ("a", "all"), ("f", "failed"), ("v", "view"), ("/", "search"), ("F", "failed only"), ("q", "close")],
-            Focus::History => &[("1-3", "panel"), ("j/k", "select"), ("⏎", "rerun"), ("a", "all"), ("f", "failed"), ("q", "close")],
-            Focus::Details => &[("1-3", "panel"), ("j/k", "scroll"), ("^d/^u", "page"), ("a", "all"), ("f", "failed"), ("q", "close")],
+            Focus::Tests => &[("1-3", "panel"), ("⏎", "run"), ("a", "all"), ("f", "failed"), ("s", "source"), ("?", "keys"), ("v", "view"), ("/", "search"), ("F", "failed only"), ("q", "close")],
+            Focus::History => &[("1-3", "panel"), ("↑↓", "select"), ("⏎", "rerun"), ("a", "all"), ("f", "failed"), ("?", "keys"), ("q", "close")],
+            Focus::Details => &[("1-3", "panel"), ("←→", "tab"), ("↑↓", "scroll"), ("^d/^u", "page"), ("a", "all"), ("f", "failed"), ("?", "keys"), ("q", "close")],
         };
-        for (key, label) in hints {
-            let key_text = format!(" {key}");
-            let label_text = format!(" {label} ");
-            let span_width = (key_text.width() + label_text.width()) as u16;
-            if let Some(code) = hint_key(key) {
-                targets.push((cursor, cursor + span_width, ClickAction::Key(code)));
-            }
-            cursor += span_width;
-            left.push(Span::styled(key_text, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
-            left.push(Span::styled(label_text, Style::default().fg(DIM)));
-        }
         let state = match (&self.snapshot.running, self.connected) {
             (_, false) => Span::styled("● disconnected ", Style::default().fg(Color::Red)),
             (Some(label), true) => {
@@ -1083,6 +1434,20 @@ impl App {
             state,
         ];
         let right_width: usize = right.iter().map(|span| span.content.width()).sum();
+        for (key, label) in hints {
+            let key_text = format!(" {key}");
+            let label_text = format!(" {label} ");
+            let span_width = (key_text.width() + label_text.width()) as u16;
+            if usize::from(cursor + span_width) + right_width + 1 > width as usize {
+                break;
+            }
+            if let Some(code) = hint_key(key) {
+                targets.push((cursor, cursor + span_width, ClickAction::Key(code)));
+            }
+            cursor += span_width;
+            left.push(Span::styled(key_text, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            left.push(Span::styled(label_text, Style::default().fg(DIM)));
+        }
         let start = (width as usize).saturating_sub(right_width) as u16;
         targets.push((start, start + 6, ClickAction::Url(DONATE_URL)));
         targets.push((start + 8, start + 20, ClickAction::Url(QUESTION_URL)));
@@ -1105,7 +1470,7 @@ fn selected_line(line: Line<'static>) -> Line<'static> {
 fn hint_key(key: &str) -> Option<KeyCode> {
     match key {
         "⏎" => Some(KeyCode::Enter),
-        "a" | "f" | "v" | "/" | "F" | "q" => key.chars().next().map(KeyCode::Char),
+        "a" | "f" | "s" | "v" | "/" | "F" | "?" | "q" => key.chars().next().map(KeyCode::Char),
         _ => None,
     }
 }
@@ -1352,6 +1717,23 @@ fn counts(nodes: &[NodeView]) -> (usize, usize, usize) {
     totals
 }
 
+fn collect_dir_files<'a>(dir: &DirNode<'a>, out: &mut Vec<&'a FileView>) {
+    out.extend(dir.files.iter().copied());
+    for child in dir.dirs.values() {
+        collect_dir_files(child, out);
+    }
+}
+
+fn expand_nodes(expanded: &mut BTreeSet<String>, parent_key: &str, nodes: &[NodeView]) {
+    for (index, node) in nodes.iter().enumerate() {
+        if !node.children.is_empty() {
+            let key = format!("{parent_key}/{index}");
+            expand_nodes(expanded, &key, &node.children);
+            expanded.insert(key);
+        }
+    }
+}
+
 fn expand_failed_nodes(expanded: &mut BTreeSet<String>, parent_key: &str, nodes: &[NodeView]) {
     for (index, node) in nodes.iter().enumerate() {
         if node.status == Status::Failed && !node.children.is_empty() {
@@ -1395,6 +1777,28 @@ fn assertion_lines(assertion: &Assertion, root: &Path) -> Vec<Line<'static>> {
         lines.extend(message_lines(message, root));
     }
     lines
+}
+
+fn error_summary(message: &str) -> Vec<String> {
+    message
+        .lines()
+        .map(str::trim)
+        .take_while(|line| !line.starts_with("at "))
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_prefix("Error: ").unwrap_or(line).to_string())
+        .take(12)
+        .collect()
+}
+
+fn token_style(token: Token) -> Style {
+    match token {
+        Token::Plain => Style::default(),
+        Token::Keyword => Style::default().fg(Color::Magenta),
+        Token::String => Style::default().fg(Color::Green),
+        Token::Comment => Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        Token::Number => Style::default().fg(Color::Yellow),
+        Token::Function => Style::default().fg(Color::Blue),
+    }
 }
 
 fn message_lines(message: &str, root: &Path) -> Vec<Line<'static>> {
