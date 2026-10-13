@@ -18,8 +18,26 @@ pub struct Snapshot {
     pub running: Option<String>,
     pub running_files: Vec<PathBuf>,
     pub runs_completed: u64,
+    #[serde(default)]
+    pub last_duration_ms: Option<u64>,
     pub last_error: Option<String>,
     pub files: Vec<FileView>,
+    #[serde(default)]
+    pub history: Vec<RunRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub finished_at: u64,
+    pub branch: Option<String>,
+    pub label: String,
+    #[serde(default)]
+    pub scope: Option<Scope>,
+    pub passed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub duration_ms: Option<u64>,
+    pub error: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

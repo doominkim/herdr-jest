@@ -1,5 +1,5 @@
 use crate::args::Scope;
-use crate::protocol::{Request, Snapshot, file_views};
+use crate::protocol::{Request, RunRecord, Snapshot, file_views};
 use crate::results::Model;
 use crate::runner::{self, RunOutput};
 use crate::{alert, config, discover, paths};
@@ -9,7 +9,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 enum Event {
     Connected(u64, UnixStream),
@@ -28,9 +29,13 @@ struct Daemon {
     test_files: BTreeSet<PathBuf>,
     queue: VecDeque<Scope>,
     running: Option<String>,
+    running_scope: Option<Scope>,
     running_files: BTreeSet<PathBuf>,
     runs_completed: u64,
+    run_started: Option<Instant>,
+    last_duration_ms: Option<u64>,
     last_error: Option<String>,
+    history: Vec<RunRecord>,
     clients: Vec<(u64, UnixStream)>,
     tx: Sender<Event>,
 }
@@ -63,9 +68,13 @@ pub fn serve(root: &Path) -> std::io::Result<()> {
         test_files: BTreeSet::new(),
         queue: VecDeque::new(),
         running: None,
+        running_scope: None,
         running_files: BTreeSet::new(),
         runs_completed: saved.runs_completed,
+        run_started: None,
+        last_duration_ms: saved.last_duration_ms,
         last_error: None,
+        history: saved.history,
         clients: Vec::new(),
         tx,
     };
@@ -162,6 +171,8 @@ impl Daemon {
             return;
         };
         self.running = Some(label(&scope, &self.root));
+        self.running_scope = Some(scope.clone());
+        self.run_started = Some(Instant::now());
         self.running_files = match &scope {
             Scope::All => self.test_files.clone(),
             Scope::File(file) | Scope::SavedTestFile(file) => [file.clone()].into(),
@@ -187,13 +198,31 @@ impl Daemon {
     fn on_run_finished(&mut self, output: RunOutput) {
         self.last_error = output.error;
         let mut newly_failed = Vec::new();
+        let mut totals = None;
         if let Some(report) = output.report {
+            totals = report_totals(&report);
             match self.model.apply(&report) {
                 Ok(failed) => newly_failed = failed,
                 Err(error) => self.last_error = Some(format!("jest report: {error}")),
             }
         }
-        self.running = None;
+        self.last_duration_ms = self.run_started.take().map(|started| started.elapsed().as_millis() as u64);
+        let (passed, failed, skipped) = totals.unwrap_or_default();
+        self.history.insert(
+            0,
+            RunRecord {
+                finished_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or_default(),
+                branch: current_branch(&self.root),
+                label: self.running.take().unwrap_or_default(),
+                scope: self.running_scope.take(),
+                passed,
+                failed,
+                skipped,
+                duration_ms: self.last_duration_ms,
+                error: totals.is_none(),
+            },
+        );
+        self.history.truncate(HISTORY_LIMIT);
         self.running_files.clear();
         self.runs_completed += 1;
         self.persist();
@@ -210,8 +239,10 @@ impl Daemon {
             running: self.running.clone(),
             running_files: self.running_files.iter().cloned().collect(),
             runs_completed: self.runs_completed,
+            last_duration_ms: self.last_duration_ms,
             last_error: self.last_error.clone(),
             files: file_views(&self.model),
+            history: self.history.clone(),
         }
     }
 
@@ -270,6 +301,29 @@ fn spawn_ticker(tx: Sender<Event>) {
     });
 }
 
+const HISTORY_LIMIT: usize = 50;
+
+fn report_totals(report: &str) -> Option<(u64, u64, u64)> {
+    let json: serde_json::Value = serde_json::from_str(report).ok()?;
+    let count = |key: &str| json.get(key).and_then(serde_json::Value::as_u64).unwrap_or_default();
+    Some((count("numPassedTests"), count("numFailedTests"), count("numPendingTests") + count("numTodoTests")))
+}
+
+fn current_branch(root: &Path) -> Option<String> {
+    git_output(root, &["symbolic-ref", "--short", "HEAD"]).or_else(|| git_output(root, &["rev-parse", "--short", "HEAD"]))
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (output.status.success() && !text.is_empty()).then_some(text)
+}
+
 fn scope_file(scope: &Scope) -> Option<PathBuf> {
     match scope {
         Scope::File(file) | Scope::Describe { file, .. } | Scope::Test { file, .. } => Some(file.clone()),
@@ -280,11 +334,11 @@ fn scope_file(scope: &Scope) -> Option<PathBuf> {
 fn label(scope: &Scope, root: &Path) -> String {
     let short = |file: &Path| file.strip_prefix(root).unwrap_or(file).display().to_string();
     match scope {
-        Scope::All => "전체".into(),
+        Scope::All => "all tests".into(),
         Scope::File(file) => short(file),
         Scope::Describe { full_name, .. } | Scope::Test { full_name, .. } => full_name.clone(),
-        Scope::Failed(failures) => format!("실패 {}개", failures.len()),
-        Scope::SavedTestFile(file) => format!("저장: {}", short(file)),
-        Scope::SavedSource(file) => format!("관련: {}", short(file)),
+        Scope::Failed(failures) => format!("{} failed", failures.len()),
+        Scope::SavedTestFile(file) => format!("saved: {}", short(file)),
+        Scope::SavedSource(file) => format!("related: {}", short(file)),
     }
 }

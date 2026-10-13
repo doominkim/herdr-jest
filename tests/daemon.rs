@@ -38,6 +38,11 @@ fn sandbox() -> Sandbox {
         fs::copy(Path::new(FIXTURE).join(file), root.join(file)).unwrap();
     }
     symlink(Path::new(FIXTURE).join("node_modules"), root.join("node_modules")).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git").args(args).current_dir(&root).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
 
     let notify_log = base.join("notify.log");
     let fake_herdr = base.join("fake-herdr");
@@ -190,6 +195,13 @@ fn daemon_runs_on_demand_keeps_results_across_restarts_and_notifies_only_when_un
     );
     assert_eq!(file(&after_all, &sandbox.root, "src/price.spec.js")["status"], "passed");
     assert_eq!(notifications(&sandbox).len(), 0, "watched run must not notify");
+    let history = after_all["history"].as_array().expect("history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["label"], "all tests");
+    assert_eq!(history[0]["scope"], "all");
+    assert_eq!(history[0]["branch"], "main");
+    assert_eq!((history[0]["passed"].as_u64(), history[0]["failed"].as_u64(), history[0]["skipped"].as_u64()), (Some(4), Some(1), Some(1)));
+    assert!(history[0]["finished_at"].as_u64().unwrap() > 1_700_000_000);
 
     client.send(json!({ "cmd": "run_failed" }));
     client.wait_for("failed-only run", |s| s["runs_completed"] == 2 && s["running"].is_null());
@@ -215,6 +227,8 @@ fn daemon_runs_on_demand_keeps_results_across_restarts_and_notifies_only_when_un
     let mut client = Client::connect(&sandbox.state);
     let restored = client.wait_for("restored results", |s| s["files"].as_array().is_some_and(|f| f.len() == 2));
     assert_eq!(restored["runs_completed"], 3);
+    let labels: Vec<&str> = restored["history"].as_array().unwrap().iter().map(|run| run["label"].as_str().unwrap()).collect();
+    assert_eq!(labels, vec!["src/price.spec.js", "1 failed", "all tests"]);
     assert_eq!(file(&restored, &sandbox.root, "src/price.spec.js")["status"], "failed");
     assert_eq!(file(&restored, &sandbox.root, "math.spec.js")["nodes"][0]["children"][1]["status"], "failed");
     stop(&mut sandbox, &mut client);

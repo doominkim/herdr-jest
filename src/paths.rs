@@ -19,6 +19,10 @@ pub fn state_file(root: &Path) -> PathBuf {
     state_dir().join(format!("{}.json", root_hash(root)))
 }
 
+pub fn view_file(root: &Path) -> PathBuf {
+    state_dir().join(format!("{}.view.json", root_hash(root)))
+}
+
 pub fn run_output(root: &Path) -> PathBuf {
     state_dir().join(format!("{}-run.json", root_hash(root)))
 }
