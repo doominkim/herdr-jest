@@ -1,0 +1,18 @@
+[package]
+name = "herdr-jest"
+version = "0.1.0"
+edition = "2024"
+description = "A Jest test explorer for herdr"
+license = "MIT"
+repository = "https://github.com/doominkim/herdr-jest"
+
+[dependencies]
+crossterm = "0.29"
+glob = "0.3.4"
+libc = "0.2.190"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1.8"
+tree-sitter = "0.27"
+tree-sitter-typescript = "0.23"

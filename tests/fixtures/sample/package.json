@@ -1,0 +1,10 @@
+{
+  "name": "herdr-jest-fixture",
+  "private": true,
+  "jest": {
+    "testMatch": ["<rootDir>/**/*.spec.js"]
+  },
+  "devDependencies": {
+    "jest": "29.7.0"
+  }
+}

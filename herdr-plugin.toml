@@ -1,0 +1,17 @@
+id = "herdr-jest"
+name = "herdr-jest"
+version = "0.1.0"
+description = "Jest test explorer in a popup: tree, run selected, failure details, auto-run on save."
+min_herdr_version = "0.7.4"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["/bin/sh", "scripts/build.sh"]
+
+[[panes]]
+id = "popup"
+title = "herdr-jest"
+placement = "popup"
+width = "100%"
+height = "100%"
+command = ["/bin/sh", "bin/open.sh"]
