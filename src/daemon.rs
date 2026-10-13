@@ -176,6 +176,7 @@ impl Daemon {
         self.running_files = match &scope {
             Scope::All => self.test_files.clone(),
             Scope::File(file) | Scope::SavedTestFile(file) => [file.clone()].into(),
+            Scope::Files(files) => files.iter().cloned().collect(),
             Scope::Describe { file, .. } | Scope::Test { file, .. } => [file.clone()].into(),
             Scope::Failed(failures) => failures.iter().map(|(file, _)| file.clone()).collect(),
             Scope::SavedSource(_) => BTreeSet::new(),
@@ -336,6 +337,10 @@ fn label(scope: &Scope, root: &Path) -> String {
     match scope {
         Scope::All => "all tests".into(),
         Scope::File(file) => short(file),
+        Scope::Files(files) => match files.first().and_then(|file| file.parent()) {
+            Some(dir) if files.len() > 1 => format!("{}/ ({} files)", short(dir), files.len()),
+            _ => files.first().map(|file| short(file)).unwrap_or_default(),
+        },
         Scope::Describe { full_name, .. } | Scope::Test { full_name, .. } => full_name.clone(),
         Scope::Failed(failures) => format!("{} failed", failures.len()),
         Scope::SavedTestFile(file) => format!("saved: {}", short(file)),

@@ -14,11 +14,15 @@
 
 ## See every test at a glance.
 
-Open the popup and your spec files appear as file › describe › test trees, with ✓ ✗ ○ from the last run. `it.each` tables and `.only` / `.skip` variants are recognized.
+Open the popup and your spec files appear with ✓ ✗ ○ from the last run. Switch between three views: a file › describe › test tree, the same tree grouped by folder, or a flat list of files. `it.each` tables and `.only` / `.skip` variants are recognized.
 
 ## Run exactly what you need.
 
-Run a file, a describe block, a single test, everything, or only what failed. Runs continue in a per-repository background process after you close the popup, and the results are still there when you open it again, even after a restart. If a run you left behind finds new failures, herdr shows a notification.
+Run a folder, a file, a describe block, a single test, everything, or only what failed. Runs continue in a per-repository background process after you close the popup, and the results are still there when you open it again, even after a restart. If a run you left behind finds new failures, herdr shows a notification.
+
+## Look back at past runs.
+
+The History panel lists recent runs with the branch, time, scope, passed and failed counts, and duration. Select one to see its summary and run the same scope again.
 
 ## Read failures in place.
 
@@ -46,16 +50,20 @@ description = "Open herdr-jest"
 
 | Key | Action |
 |---|---|
-| `j` `k` | Move |
-| `l` `h` | Expand / collapse |
-| `Enter` | Run the selected file, describe, or test |
+| `1` `2` `3` `Tab` | Focus Tests, History, or Details |
+| `j` `k` | Move, or scroll in Details |
+| `l` `h` | Expand and step into children / collapse or go to parent |
+| `Enter` | Run the selection (in History: rerun that scope) |
 | `a` | Run all tests |
 | `f` | Rerun failed tests |
+| `v` | Switch view: tree, folders, files |
 | `F` | Show failed tests only |
 | `/` | Search by name |
 | `Ctrl+d` `Ctrl+u` | Scroll the detail pane |
 | `X` | Stop the background process |
 | `q` `Esc` `F2` | Close |
+
+The mouse works too: click a panel or row to select it, click `▸` / `▾` to expand or collapse, double-click to run, scroll with the wheel, and click any key hint in the bottom bar.
 
 ## Configure the Jest command
 

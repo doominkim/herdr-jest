@@ -95,3 +95,13 @@ fn failed_only_groups_files_once_and_alternates_anchored_names() {
         ])
     );
 }
+
+#[test]
+fn folder_scope_runs_each_listed_file_by_path() {
+    let scope = Scope::Files(vec![PathBuf::from("/repo/a/one.spec.ts"), PathBuf::from("/repo/a/b/two.spec.ts")]);
+
+    assert_eq!(
+        build(&scope, Path::new(OUT)),
+        with(&["--runTestsByPath", "/repo/a/one.spec.ts", "/repo/a/b/two.spec.ts"])
+    );
+}

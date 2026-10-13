@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 pub enum Scope {
     All,
     File(PathBuf),
+    Files(Vec<PathBuf>),
     Describe { file: PathBuf, full_name: String },
     Test { file: PathBuf, full_name: String },
     Failed(Vec<(PathBuf, String)>),
@@ -36,6 +37,7 @@ pub fn build(scope: &Scope, output_file: &Path) -> Vec<String> {
         }
         Scope::All => {}
         Scope::File(file) | Scope::SavedTestFile(file) => push_by_path(&mut args, [file]),
+        Scope::Files(files) => push_by_path(&mut args, files),
         Scope::SavedSource(file) => {
             args.push("--findRelatedTests".into());
             args.push(file.display().to_string());

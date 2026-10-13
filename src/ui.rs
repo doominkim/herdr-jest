@@ -3,9 +3,9 @@ use crate::discover::NodeKind;
 use crate::paths;
 use crate::protocol::{FileView, NodeView, Request, RunRecord, Snapshot};
 use crate::results::{Assertion, Status};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
@@ -36,10 +36,14 @@ struct Row {
     has_children: bool,
     counts: (usize, usize, usize),
     duration_ms: Option<u64>,
+    indent: usize,
+    show_dir: bool,
+    files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowKind {
+    Folder,
     File,
     Describe,
     Test,
@@ -52,9 +56,46 @@ enum Focus {
     Details,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ViewMode {
+    #[default]
+    Tree,
+    Folders,
+    Files,
+}
+
+impl ViewMode {
+    fn next(self) -> ViewMode {
+        match self {
+            ViewMode::Tree => ViewMode::Folders,
+            ViewMode::Folders => ViewMode::Files,
+            ViewMode::Files => ViewMode::Tree,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ViewMode::Tree => "tree",
+            ViewMode::Folders => "folders",
+            ViewMode::Files => "files",
+        }
+    }
+}
+
+#[derive(Default)]
+struct DirNode<'a> {
+    dirs: std::collections::BTreeMap<String, DirNode<'a>>,
+    files: Vec<&'a FileView>,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct SavedView {
     expanded: BTreeSet<String>,
+    #[serde(default)]
+    collapsed_folders: BTreeSet<String>,
+    #[serde(default)]
+    mode: ViewMode,
     selected: usize,
 }
 
@@ -72,6 +113,26 @@ struct App {
     started: Instant,
     focus: Focus,
     history_list: ListState,
+    mode: ViewMode,
+    collapsed_folders: BTreeSet<String>,
+    targets: Vec<ClickTarget>,
+    tree_area: Rect,
+    history_area: Rect,
+    detail_area: Rect,
+    last_click: Option<(Instant, Focus, usize)>,
+}
+
+#[derive(Clone, Copy)]
+enum ClickAction {
+    Url(&'static str),
+    Key(KeyCode),
+}
+
+struct ClickTarget {
+    y: u16,
+    start: u16,
+    end: u16,
+    action: ClickAction,
 }
 
 pub fn run(cwd: &Path) -> std::io::Result<()> {
@@ -120,12 +181,26 @@ pub fn run(cwd: &Path) -> std::io::Result<()> {
         started: Instant::now(),
         focus: Focus::Tests,
         history_list: ListState::default().with_selected(Some(0)),
+        mode: saved_view.mode,
+        collapsed_folders: saved_view.collapsed_folders,
+        targets: Vec::new(),
+        tree_area: Rect::default(),
+        history_area: Rect::default(),
+        detail_area: Rect::default(),
+        last_click: None,
     };
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let result = app.event_loop(&mut terminal, rx);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
 
-    let view = SavedView { expanded: app.expanded, selected: app.list.selected().unwrap_or(0) };
+    let view = SavedView {
+        expanded: app.expanded,
+        collapsed_folders: app.collapsed_folders,
+        mode: app.mode,
+        selected: app.list.selected().unwrap_or(0),
+    };
     if let Ok(json) = serde_json::to_vec(&view) {
         let _ = std::fs::write(view_file, json);
     }
@@ -154,8 +229,21 @@ impl App {
             if !event::poll(Duration::from_millis(150))? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Mouse(mouse) => {
+                    let keep_going = match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => self.on_click(mouse.column, mouse.row, &rows),
+                        MouseEventKind::ScrollDown => self.on_scroll(mouse.column, mouse.row, 3, &rows),
+                        MouseEventKind::ScrollUp => self.on_scroll(mouse.column, mouse.row, -3, &rows),
+                        _ => true,
+                    };
+                    if !keep_going {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                _ => continue,
             };
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -208,6 +296,11 @@ impl App {
             KeyCode::Char('F') => {
                 self.focus = Focus::Tests;
                 self.failed_only = !self.failed_only;
+                self.list.select(Some(0));
+            }
+            KeyCode::Char('v') => {
+                self.focus = Focus::Tests;
+                self.mode = self.mode.next();
                 self.list.select(Some(0));
             }
             KeyCode::Char('/') => {
@@ -272,10 +365,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(selected, -1, rows.len()),
             KeyCode::Char('l') | KeyCode::Right => {
                 if let Some(row) = row.filter(|row| row.has_children) {
-                    if self.expanded.contains(&row.key) {
+                    if self.is_open(row) {
                         self.move_selection(selected, 1, rows.len());
                     } else {
-                        self.expanded.insert(row.key.clone());
+                        self.set_open(row, true);
                     }
                 }
             }
@@ -298,11 +391,32 @@ impl App {
         self.detail_scroll = 0;
     }
 
+    fn is_open(&self, row: &Row) -> bool {
+        match row.kind {
+            RowKind::Folder => !self.collapsed_folders.contains(&row.key),
+            _ => self.expanded.contains(&row.key),
+        }
+    }
+
+    fn set_open(&mut self, row: &Row, open: bool) {
+        let set = match row.kind {
+            RowKind::Folder => &mut self.collapsed_folders,
+            _ => &mut self.expanded,
+        };
+        let insert = if row.kind == RowKind::Folder { !open } else { open };
+        if insert {
+            set.insert(row.key.clone());
+        } else {
+            set.remove(&row.key);
+        }
+    }
+
     fn collapse_or_parent(&mut self, selected: usize, rows: &[Row]) {
         let Some(row) = rows.get(selected) else {
             return;
         };
-        if self.expanded.remove(&row.key) {
+        if row.has_children && self.is_open(row) {
+            self.set_open(row, false);
             return;
         }
         let parent = rows[..selected].iter().rposition(|candidate| candidate.depth < row.depth);
@@ -336,41 +450,123 @@ impl App {
     }
 
     fn rows(&self) -> Vec<Row> {
-        let query = self.query.to_lowercase();
+        match self.mode {
+            ViewMode::Tree => self.snapshot.files.iter().filter_map(|file| self.file_rows(file, 0, true, true)).flatten().collect(),
+            ViewMode::Files => self.snapshot.files.iter().filter_map(|file| self.file_rows(file, 0, true, false)).flatten().collect(),
+            ViewMode::Folders => {
+                let mut root = DirNode::default();
+                for file in &self.snapshot.files {
+                    let relative = file.path.strip_prefix(&self.root).unwrap_or(&file.path);
+                    let mut dir = &mut root;
+                    if let Some(parent) = relative.parent() {
+                        for component in parent.components() {
+                            let name = component.as_os_str().to_string_lossy().to_string();
+                            dir = dir.dirs.entry(name).or_default();
+                        }
+                    }
+                    dir.files.push(file);
+                }
+                let mut rows = Vec::new();
+                self.folder_rows(&root, "", 0, &mut rows);
+                rows
+            }
+        }
+    }
+
+    fn folder_rows(&self, dir: &DirNode, prefix: &str, depth: usize, out: &mut Vec<Row>) {
         let running: BTreeSet<&PathBuf> = self.snapshot.running_files.iter().collect();
-        let mut rows = Vec::new();
-        for file in &self.snapshot.files {
-            if self.failed_only && file.status != Status::Failed {
-                continue;
+        for (name, child) in &dir.dirs {
+            let mut label = name.clone();
+            let mut node = child;
+            while node.files.is_empty() && node.dirs.len() == 1 {
+                let (next_name, next) = node.dirs.iter().next().expect("one child");
+                label = format!("{label}/{next_name}");
+                node = next;
             }
-            let relative = file.path.strip_prefix(&self.root).unwrap_or(&file.path).display().to_string();
-            let file_matches = query.is_empty() || relative.to_lowercase().contains(&query);
+            let path = if prefix.is_empty() { label.clone() } else { format!("{prefix}/{label}") };
             let mut children = Vec::new();
-            let key = file.path.display().to_string();
-            let forced_open = !query.is_empty() && !file_matches;
-            let open = self.expanded.contains(&key) || forced_open;
-            let any_child = self.node_rows(file, &file.nodes, &key, &[], open, file_matches, &mut children);
-            if !file_matches && !any_child {
+            self.folder_rows(node, &path, depth + 1, &mut children);
+            if children.is_empty() {
                 continue;
             }
-            rows.push(Row {
-                depth: 0,
-                key,
-                label: relative,
-                status: file.status,
-                running: running.contains(&file.path),
-                kind: RowKind::File,
-                file: file.path.clone(),
-                full_name: String::new(),
+            let files: Vec<PathBuf> = children
+                .iter()
+                .filter(|row| row.kind == RowKind::File)
+                .map(|row| row.file.clone())
+                .collect();
+            let file_views: Vec<&FileView> =
+                self.snapshot.files.iter().filter(|file| files.contains(&file.path)).collect();
+            let status = folder_status(file_views.iter().map(|file| file.status));
+            let counts = file_views
+                .iter()
+                .map(|file| counts(&file.nodes))
+                .fold((0, 0, 0), |(p, f, s), (fp, ff, fs)| (p + fp, f + ff, s + fs));
+            let row = Row {
+                depth,
+                key: format!("dir:{path}"),
+                label,
+                status,
+                running: files.iter().any(|file| running.contains(file)),
+                kind: RowKind::Folder,
+                file: self.root.join(&path),
+                full_name: path.clone(),
                 node_path: Vec::new(),
                 dynamic: false,
-                has_children: !file.nodes.is_empty(),
-                counts: counts(&file.nodes),
+                has_children: true,
+                counts,
                 duration_ms: None,
-            });
-            rows.extend(children);
+                indent: depth,
+                show_dir: false,
+                files,
+            };
+            let open = self.is_open(&row) || !self.query.is_empty() || self.failed_only;
+            out.push(row);
+            if open {
+                out.extend(children);
+            }
         }
-        rows
+        for file in &dir.files {
+            if let Some(rows) = self.file_rows(file, depth, false, true) {
+                out.extend(rows);
+            }
+        }
+    }
+
+    fn file_rows(&self, file: &FileView, depth: usize, show_dir: bool, with_children: bool) -> Option<Vec<Row>> {
+        if self.failed_only && file.status != Status::Failed {
+            return None;
+        }
+        let query = self.query.to_lowercase();
+        let relative = file.path.strip_prefix(&self.root).unwrap_or(&file.path).display().to_string();
+        let file_matches = query.is_empty() || relative.to_lowercase().contains(&query);
+        let key = file.path.display().to_string();
+        let forced_open = !query.is_empty() && !file_matches;
+        let open = with_children && (self.expanded.contains(&key) || forced_open);
+        let mut children = Vec::new();
+        let any_child = self.node_rows(file, &file.nodes, &key, &[], depth, open, file_matches, &mut children);
+        if !file_matches && !any_child {
+            return None;
+        }
+        let mut rows = vec![Row {
+            depth,
+            key,
+            label: relative,
+            status: file.status,
+            running: self.snapshot.running_files.contains(&file.path),
+            kind: RowKind::File,
+            file: file.path.clone(),
+            full_name: String::new(),
+            node_path: Vec::new(),
+            dynamic: false,
+            has_children: with_children && !file.nodes.is_empty(),
+            counts: counts(&file.nodes),
+            duration_ms: None,
+            indent: depth,
+            show_dir,
+            files: vec![file.path.clone()],
+        }];
+        rows.extend(children);
+        Some(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -380,6 +576,7 @@ impl App {
         nodes: &[NodeView],
         parent_key: &str,
         parent_path: &[usize],
+        file_depth: usize,
         visible: bool,
         include_all: bool,
         out: &mut Vec<Row>,
@@ -396,7 +593,8 @@ impl App {
             let self_matches = include_all || node.name.to_lowercase().contains(&query);
             let open = self.expanded.contains(&key) || (!query.is_empty() && !self_matches);
             let mut children = Vec::new();
-            let child_matches = self.node_rows(file, &node.children, &key, &node_path, visible && open, self_matches, &mut children);
+            let child_matches =
+                self.node_rows(file, &node.children, &key, &node_path, file_depth, visible && open, self_matches, &mut children);
             if !self_matches && !child_matches {
                 continue;
             }
@@ -404,7 +602,7 @@ impl App {
             if visible {
                 let durations: Vec<u64> = node.assertions.iter().filter_map(|a| a.duration_ms).collect();
                 out.push(Row {
-                    depth: node_path.len(),
+                    depth: file_depth + node_path.len(),
                     key,
                     label: node.name.clone(),
                     status: node.status,
@@ -420,6 +618,9 @@ impl App {
                     has_children: !node.children.is_empty(),
                     counts: counts(&node.children),
                     duration_ms: (!durations.is_empty()).then(|| durations.iter().sum()),
+                    indent: file_depth,
+                    show_dir: false,
+                    files: Vec::new(),
                 });
                 out.extend(children);
             }
@@ -443,18 +644,25 @@ impl App {
         let history_height = self.snapshot.history.len().clamp(1, HISTORY_ROWS) as u16 + 2;
         let [tree_area, history_area] =
             Layout::vertical([Constraint::Min(5), Constraint::Length(history_height)]).areas(left_area);
+        self.tree_area = tree_area;
+        self.history_area = history_area;
+        self.detail_area = detail_area;
 
         frame.render_widget(Paragraph::new(self.header_line(header.width)), header);
 
         let inner_width = tree_area.width.saturating_sub(3) as usize;
         let items: Vec<ListItem> = rows.iter().map(|row| ListItem::new(self.row_line(row, inner_width))).collect();
-        let title = if self.searching || !self.query.is_empty() {
-            Line::from(vec![Span::raw(" [1] Tests "), Span::styled(format!("/{} ", self.query), Style::default().fg(ACCENT))])
-        } else if self.failed_only {
-            Line::from(vec![Span::raw(" [1] Tests "), Span::styled("failed only ", Style::default().fg(Color::Red))])
-        } else {
-            Line::raw(" [1] Tests ")
-        };
+        let mut title_spans = vec![
+            Span::raw(" [1] Tests "),
+            Span::styled(format!("· {} ", self.mode.name()), Style::default().fg(DIM)),
+        ];
+        if self.searching || !self.query.is_empty() {
+            title_spans.push(Span::styled(format!("/{} ", self.query), Style::default().fg(ACCENT)));
+        }
+        if self.failed_only {
+            title_spans.push(Span::styled("failed only ", Style::default().fg(Color::Red)));
+        }
+        let title = Line::from(title_spans);
         let list = List::new(items)
             .block(panel(title, self.focus == Focus::Tests))
             .highlight_symbol(Span::styled("▌", Style::default().fg(ACCENT)))
@@ -502,7 +710,12 @@ impl App {
                 error_bar,
             );
         }
-        frame.render_widget(Paragraph::new(self.footer_line(footer.width)), footer);
+        let (footer_line, targets) = self.footer_line(footer.width);
+        self.targets = targets
+            .into_iter()
+            .map(|(start, end, action)| ClickTarget { y: footer.y, start: footer.x + start, end: footer.x + end, action })
+            .collect();
+        frame.render_widget(Paragraph::new(footer_line), footer);
     }
 
     fn header_line(&self, width: u16) -> Line<'static> {
@@ -542,7 +755,7 @@ impl App {
     }
 
     fn row_line(&self, row: &Row, width: usize) -> Line<'static> {
-        let open = self.expanded.contains(&row.key);
+        let open = self.is_open(row) || (row.kind == RowKind::Folder && (!self.query.is_empty() || self.failed_only));
         let fold = match (row.has_children, open) {
             (false, _) => "  ",
             (true, true) => "▾ ",
@@ -550,23 +763,41 @@ impl App {
         };
         let mut left: Vec<Span<'static>> = Vec::new();
         let mut right: Vec<Span<'static>> = Vec::new();
+        left.push(Span::raw("  ".repeat(row.indent)));
         match row.kind {
+            RowKind::Folder => {
+                left.push(Span::styled(fold, Style::default().fg(DIM)));
+                let (icon, color) = icon(row.status);
+                left.push(Span::styled(format!("{icon} "), Style::default().fg(color)));
+                right.extend(count_spans(row.counts));
+                let used: usize = left.iter().chain(&right).map(|span| span.content.width()).sum();
+                let label = ellipsize_middle(&format!("{}/", row.label), width.saturating_sub(used + 1));
+                left.push(Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)));
+            }
             RowKind::File => {
                 left.push(Span::styled(fold, Style::default().fg(DIM)));
                 left.push(self.badge(row));
                 left.push(Span::raw(" "));
-                let (dir, name) = match row.label.rfind('/') {
-                    Some(index) => (row.label[..=index].to_string(), row.label[index + 1..].to_string()),
+                let (dir, name) = match row.label.rsplit_once('/') {
+                    Some((dir, name)) if row.show_dir => (dir.to_string(), name.to_string()),
+                    Some((_, name)) => (String::new(), name.to_string()),
                     None => (String::new(), row.label.clone()),
                 };
-                left.push(Span::styled(dir, Style::default().fg(DIM)));
-                left.push(Span::styled(name, Style::default().add_modifier(Modifier::BOLD)));
                 right.extend(count_spans(row.counts));
+                let used: usize = left.iter().chain(&right).map(|span| span.content.width()).sum();
+                let available = width.saturating_sub(used + 2);
+                let name = ellipsize_middle(&name, available);
+                let dir_room = available.saturating_sub(name.width() + 3);
+                left.push(Span::styled(name, Style::default().add_modifier(Modifier::BOLD)));
+                if !dir.is_empty() && dir_room >= 4 {
+                    left.push(Span::styled(format!("  {}", ellipsize_middle(&dir, dir_room)), Style::default().fg(DIM)));
+                }
             }
             RowKind::Describe | RowKind::Test => {
                 left.push(Span::raw("  "));
-                if row.depth > 1 {
-                    left.push(Span::styled("│ ".repeat(row.depth - 1), Style::default().fg(GUIDE)));
+                let node_depth = row.node_path.len();
+                if node_depth > 1 {
+                    left.push(Span::styled("│ ".repeat(node_depth - 1), Style::default().fg(GUIDE)));
                 }
                 left.push(Span::styled(fold, Style::default().fg(DIM)));
                 let (icon, color) = icon(row.status);
@@ -600,10 +831,44 @@ impl App {
         }
     }
 
+    fn folder_detail(&self, row: &Row) -> Text<'static> {
+        let (passed, failed, skipped) = row.counts;
+        let mut lines = vec![
+            Line::styled(format!("{}/", row.full_name), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+            Line::styled(
+                format!("{} files · {passed} passed · {failed} failed · {skipped} skipped", row.files.len()),
+                Style::default().fg(DIM),
+            ),
+            Line::styled("Press ⏎ to run every file in this folder", Style::default().fg(DIM)),
+            Line::raw(""),
+        ];
+        let prefix = self.root.join(&row.full_name);
+        let mut failures = Vec::new();
+        for file in self.snapshot.files.iter().filter(|file| row.files.contains(&file.path)) {
+            let relative = file.path.strip_prefix(&prefix).unwrap_or(&file.path).display().to_string();
+            let file_row = Row { status: file.status, running: self.snapshot.running_files.contains(&file.path), ..row.clone() };
+            let mut spans = vec![self.badge(&file_row), Span::raw(" "), Span::raw(relative), Span::raw("  ")];
+            spans.extend(count_spans(counts(&file.nodes)));
+            lines.push(Line::from(spans));
+            for node in &file.nodes {
+                collect_assertions(node, &mut failures);
+            }
+            failures.extend(file.unmatched.iter().cloned());
+        }
+        failures.retain(|assertion| assertion.status == Status::Failed);
+        for assertion in &failures {
+            lines.extend(assertion_lines(assertion, &self.root));
+        }
+        Text::from(lines)
+    }
+
     fn detail_title(&self, row: Option<&Row>) -> String {
         let Some(row) = row else {
             return "Details".into();
         };
+        if row.kind == RowKind::Folder {
+            return format!("{}/", row.full_name);
+        }
         let Some(file) = self.snapshot.files.iter().find(|file| file.path == row.file) else {
             return row.label.clone();
         };
@@ -624,12 +889,16 @@ impl App {
         let Some(row) = row else {
             return Text::styled("Looking for tests…", Style::default().fg(DIM));
         };
+        if row.kind == RowKind::Folder {
+            return self.folder_detail(row);
+        }
         let Some(file) = self.snapshot.files.iter().find(|file| file.path == row.file) else {
             return Text::default();
         };
         let mut lines = Vec::new();
         let mut assertions = Vec::new();
         match row.kind {
+            RowKind::Folder => {}
             RowKind::File => {
                 lines.push(Line::from(vec![self.badge(row), Span::raw(" "), Span::styled(row.label.clone(), Style::default().add_modifier(Modifier::BOLD))]));
                 let (passed, failed, skipped) = row.counts;
@@ -670,16 +939,114 @@ impl App {
         self.snapshot.history.get(self.history_list.selected().unwrap_or(0))
     }
 
-    fn footer_line(&self, width: u16) -> Line<'static> {
+    fn on_click(&mut self, column: u16, y: u16, rows: &[Row]) -> bool {
+        let position = Position::new(column, y);
+        let hit = self
+            .targets
+            .iter()
+            .find(|target| target.y == y && (target.start..target.end).contains(&column))
+            .map(|target| target.action);
+        match hit {
+            Some(ClickAction::Url(url)) => {
+                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let _ = Command::new(opener).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                return true;
+            }
+            Some(ClickAction::Key(code)) => return self.on_key(KeyEvent::new(code, KeyModifiers::NONE), rows),
+            None => {}
+        }
+
+        if self.tree_area.contains(position) {
+            self.set_focus(Focus::Tests);
+            let Some(index) = list_index(self.tree_area, y, self.list.offset()).filter(|index| *index < rows.len()) else {
+                return true;
+            };
+            let row = &rows[index];
+            if self.is_double_click(Focus::Tests, index) {
+                self.send(Request::Run { scope: scope_for(row) });
+                return true;
+            }
+            if self.list.selected() != Some(index) {
+                self.detail_scroll = 0;
+            }
+            self.list.select(Some(index));
+            let fold_start = self.tree_area.x + 2 + fold_offset(row);
+            if row.has_children && (fold_start..fold_start + 2).contains(&column) {
+                let open = self.is_open(row);
+                self.set_open(row, !open);
+            }
+        } else if self.history_area.contains(position) {
+            self.set_focus(Focus::History);
+            let len = self.snapshot.history.len();
+            let Some(index) = list_index(self.history_area, y, self.history_list.offset()).filter(|index| *index < len) else {
+                return true;
+            };
+            if self.is_double_click(Focus::History, index) {
+                if let Some(scope) = self.snapshot.history[index].scope.clone() {
+                    self.send(Request::Run { scope });
+                }
+                return true;
+            }
+            if self.history_list.selected() != Some(index) {
+                self.detail_scroll = 0;
+            }
+            self.history_list.select(Some(index));
+        } else if self.detail_area.contains(position) {
+            self.set_focus(Focus::Details);
+        }
+        true
+    }
+
+    fn is_double_click(&mut self, focus: Focus, index: usize) -> bool {
+        let now = Instant::now();
+        let double = self.last_click.is_some_and(|(at, last_focus, last_index)| {
+            last_focus == focus && last_index == index && now.duration_since(at) < Duration::from_millis(400)
+        });
+        self.last_click = if double { None } else { Some((now, focus, index)) };
+        double
+    }
+
+    fn on_scroll(&mut self, column: u16, y: u16, delta: isize, rows: &[Row]) -> bool {
+        let position = Position::new(column, y);
+        if self.tree_area.contains(position) {
+            let selected = self.list.selected().unwrap_or(0);
+            self.move_selection(selected, delta, rows.len());
+        } else if self.history_area.contains(position) {
+            let len = self.snapshot.history.len();
+            if len > 0 {
+                let selected = self.history_list.selected().unwrap_or(0) as isize;
+                self.history_list.select(Some((selected + delta).clamp(0, len as isize - 1) as usize));
+                self.detail_scroll = 0;
+            }
+        } else if self.detail_area.contains(position) {
+            self.detail_scroll = if delta > 0 {
+                self.detail_scroll.saturating_add(delta as u16)
+            } else {
+                self.detail_scroll.saturating_sub(delta.unsigned_abs() as u16)
+            };
+        }
+        true
+    }
+
+    fn footer_line(&self, width: u16) -> (Line<'static>, Vec<(u16, u16, ClickAction)>) {
         let mut left = Vec::new();
+        let mut targets = Vec::new();
+        let mut cursor: u16 = 0;
         let hints: &[(&str, &str)] = match self.focus {
-            Focus::Tests => &[("1-3", "panel"), ("⏎", "run"), ("a", "all"), ("f", "failed"), ("/", "search"), ("F", "failed only"), ("q", "close")],
+            Focus::Tests => &[("1-3", "panel"), ("⏎", "run"), ("a", "all"), ("f", "failed"), ("v", "view"), ("/", "search"), ("F", "failed only"), ("q", "close")],
             Focus::History => &[("1-3", "panel"), ("j/k", "select"), ("⏎", "rerun"), ("a", "all"), ("f", "failed"), ("q", "close")],
             Focus::Details => &[("1-3", "panel"), ("j/k", "scroll"), ("^d/^u", "page"), ("a", "all"), ("f", "failed"), ("q", "close")],
         };
         for (key, label) in hints {
-            left.push(Span::styled(format!(" {key}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
-            left.push(Span::styled(format!(" {label} "), Style::default().fg(DIM)));
+            let key_text = format!(" {key}");
+            let label_text = format!(" {label} ");
+            let span_width = (key_text.width() + label_text.width()) as u16;
+            if let Some(code) = hint_key(key) {
+                targets.push((cursor, cursor + span_width, ClickAction::Key(code)));
+            }
+            cursor += span_width;
+            left.push(Span::styled(key_text, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            left.push(Span::styled(label_text, Style::default().fg(DIM)));
         }
         let state = match (&self.snapshot.running, self.connected) {
             (_, false) => Span::styled("● disconnected ", Style::default().fg(Color::Red)),
@@ -689,15 +1056,53 @@ impl App {
             }
             (None, true) => Span::styled("● idle ", Style::default().fg(Color::Green)),
         };
-        justify(left, vec![state], width as usize)
+        let link_style = |color: Color| Style::default().fg(color).add_modifier(Modifier::UNDERLINED);
+        let right = vec![
+            Span::styled("Donate", link_style(Color::Magenta)),
+            Span::raw("  "),
+            Span::styled("Ask Question", link_style(ACCENT)),
+            Span::raw("  "),
+            Span::styled(env!("CARGO_PKG_VERSION"), Style::default().fg(DIM)),
+            Span::raw("  "),
+            state,
+        ];
+        let right_width: usize = right.iter().map(|span| span.content.width()).sum();
+        let start = (width as usize).saturating_sub(right_width) as u16;
+        targets.push((start, start + 6, ClickAction::Url(DONATE_URL)));
+        targets.push((start + 8, start + 20, ClickAction::Url(QUESTION_URL)));
+        (justify(left, right, width as usize), targets)
+    }
+}
+
+fn hint_key(key: &str) -> Option<KeyCode> {
+    match key {
+        "⏎" => Some(KeyCode::Enter),
+        "a" | "f" | "v" | "/" | "F" | "q" => key.chars().next().map(KeyCode::Char),
+        _ => None,
+    }
+}
+
+fn list_index(area: Rect, y: u16, offset: usize) -> Option<usize> {
+    let first = area.y + 1;
+    let last = area.y + area.height.saturating_sub(1);
+    (first..last).contains(&y).then(|| offset + usize::from(y - first))
+}
+
+fn fold_offset(row: &Row) -> u16 {
+    let indent = row.indent as u16 * 2;
+    match row.kind {
+        RowKind::Folder | RowKind::File => indent,
+        RowKind::Describe | RowKind::Test => indent + 2 + row.node_path.len().saturating_sub(1) as u16 * 2,
     }
 }
 
 const HISTORY_ROWS: usize = 6;
+const DONATE_URL: &str = "https://github.com/sponsors/doominkim";
+const QUESTION_URL: &str = "https://github.com/doominkim/herdr-jest/issues";
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const GUIDE: Color = Color::Indexed(238);
-const SELECTED_BG: Color = Color::Indexed(236);
+const SELECTED_BG: Color = Color::Indexed(24);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
@@ -778,7 +1183,7 @@ fn history_line(run: &RunRecord, width: usize) -> Line<'static> {
     let left = vec![
         Span::styled(time, Style::default().fg(DIM)),
         Span::styled(branch, Style::default().fg(ACCENT)),
-        Span::styled(truncate(&run.label, label_width), Style::default().fg(label_color)),
+        Span::styled(ellipsize_middle(&run.label, label_width), Style::default().fg(label_color)),
     ];
     justify(left, right, width)
 }
@@ -801,6 +1206,40 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+fn ellipsize_middle(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    if max <= 1 {
+        return "…".repeat(max);
+    }
+    let keep = max - 1;
+    let head_budget = keep / 2;
+    let tail_budget = keep - head_budget;
+    let mut head = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > head_budget {
+            break;
+        }
+        head.push(c);
+        used += w;
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > tail_budget {
+            break;
+        }
+        tail.push(c);
+        used += w;
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
+}
+
 fn local_time(unix_secs: u64) -> String {
     let time = unix_secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -814,6 +1253,7 @@ fn format_duration(ms: u64) -> String {
 
 fn scope_for(row: &Row) -> Scope {
     match row.kind {
+        RowKind::Folder => Scope::Files(row.files.clone()),
         RowKind::File => Scope::File(row.file.clone()),
         _ if row.dynamic => Scope::File(row.file.clone()),
         RowKind::Describe => Scope::Describe { file: row.file.clone(), full_name: row.full_name.clone() },
@@ -828,6 +1268,19 @@ fn icon(status: Status) -> (&'static str, Color) {
         Status::Skipped => ("○", DIM),
         Status::Unknown => ("·", DIM),
     }
+}
+
+fn folder_status(statuses: impl Iterator<Item = Status>) -> Status {
+    let mut seen = Status::Unknown;
+    for status in statuses {
+        match (seen, status) {
+            (_, Status::Failed) => return Status::Failed,
+            (_, Status::Passed) => seen = Status::Passed,
+            (Status::Unknown, Status::Skipped) => seen = Status::Skipped,
+            _ => {}
+        }
+    }
+    seen
 }
 
 fn counts(nodes: &[NodeView]) -> (usize, usize, usize) {
