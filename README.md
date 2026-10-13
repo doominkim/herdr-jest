@@ -10,6 +10,8 @@
   </p>
 </div>
 
+<p align="center"><img src="docs/demo/demo.gif" width="960" alt="Running all tests, reading a failure, switching between tree, folder and file views, rerunning one test, and filtering to failed tests"></p>
+
 > **In development.** Expect rough edges and breaking changes before 1.0.
 
 ## See every test at a glance.

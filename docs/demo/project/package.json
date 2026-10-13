@@ -1,0 +1,10 @@
+{
+  "name": "acme-shop",
+  "private": true,
+  "jest": {
+    "testMatch": ["<rootDir>/src/**/*.spec.js"]
+  },
+  "devDependencies": {
+    "jest": "29.7.0"
+  }
+}

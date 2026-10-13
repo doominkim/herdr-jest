@@ -651,7 +651,15 @@ impl App {
         frame.render_widget(Paragraph::new(self.header_line(header.width)), header);
 
         let inner_width = tree_area.width.saturating_sub(3) as usize;
-        let items: Vec<ListItem> = rows.iter().map(|row| ListItem::new(self.row_line(row, inner_width))).collect();
+        let selected_index = self.list.selected();
+        let items: Vec<ListItem> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let line = self.row_line(row, inner_width);
+                ListItem::new(if selected_index == Some(index) { selected_line(line) } else { line })
+            })
+            .collect();
         let mut title_spans = vec![
             Span::raw(" [1] Tests "),
             Span::styled(format!("· {} ", self.mode.name()), Style::default().fg(DIM)),
@@ -667,7 +675,7 @@ impl App {
             .block(panel(title, self.focus == Focus::Tests))
             .highlight_symbol(Span::styled("▌", Style::default().fg(ACCENT)))
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD));
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
         frame.render_stateful_widget(list, tree_area, &mut self.list);
 
         let history_focused = self.focus == Focus::History;
@@ -825,7 +833,7 @@ impl App {
         }
         match row.status {
             Status::Passed => Span::styled(" PASS ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
-            Status::Failed => Span::styled(" FAIL ", Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)),
+            Status::Failed => Span::styled(" FAIL ", Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)),
             Status::Skipped => Span::styled(" SKIP ", Style::default().fg(Color::Black).bg(DIM)),
             Status::Unknown => Span::styled("  ··  ", Style::default().fg(DIM)),
         }
@@ -1074,6 +1082,18 @@ impl App {
     }
 }
 
+fn selected_line(line: Line<'static>) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let style = if span.style.bg.is_none() { span.style.bg(SELECTED_BG) } else { span.style };
+            Span::styled(span.content, style)
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
 fn hint_key(key: &str) -> Option<KeyCode> {
     match key {
         "⏎" => Some(KeyCode::Enter),
@@ -1287,12 +1307,21 @@ fn counts(nodes: &[NodeView]) -> (usize, usize, usize) {
     let mut totals = (0, 0, 0);
     for node in nodes {
         match node.kind {
-            NodeKind::Test => match node.status {
-                Status::Passed => totals.0 += 1,
-                Status::Failed => totals.1 += 1,
-                Status::Skipped => totals.2 += 1,
-                Status::Unknown => {}
-            },
+            NodeKind::Test if !node.assertions.is_empty() => {
+                for assertion in &node.assertions {
+                    match assertion.status {
+                        Status::Passed => totals.0 += 1,
+                        Status::Failed => totals.1 += 1,
+                        Status::Skipped => totals.2 += 1,
+                        Status::Unknown => {}
+                    }
+                }
+            }
+            NodeKind::Test => {
+                if node.status == Status::Skipped {
+                    totals.2 += 1;
+                }
+            }
             NodeKind::Describe => {
                 let (p, f, s) = counts(&node.children);
                 totals = (totals.0 + p, totals.1 + f, totals.2 + s);
