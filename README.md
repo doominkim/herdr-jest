@@ -24,7 +24,7 @@ Run a folder, a file, a describe block, a single test, everything, or only what 
 
 ## Look back at past runs.
 
-The History panel lists recent runs with the branch, time, scope, passed and failed counts, and duration. Select one to see its summary and run the same scope again.
+The History panel expands when you focus it and lists recent runs with the branch, time, scope, passed and failed counts, and duration. Select one to see its summary and run the same scope again.
 
 ## Read failures in place.
 

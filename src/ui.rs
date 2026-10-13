@@ -641,7 +641,13 @@ impl App {
         .areas(frame.area());
         let [left_area, detail_area] =
             Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body);
-        let history_height = self.snapshot.history.len().clamp(1, HISTORY_ROWS) as u16 + 2;
+        let history_focused = self.focus == Focus::History;
+        let history_rows = if history_focused {
+            (left_area.height as usize * 3 / 5).saturating_sub(2).max(HISTORY_COLLAPSED_ROWS)
+        } else {
+            HISTORY_COLLAPSED_ROWS
+        };
+        let history_height = self.snapshot.history.len().clamp(1, history_rows) as u16 + 2;
         let [tree_area, history_area] =
             Layout::vertical([Constraint::Min(5), Constraint::Length(history_height)]).areas(left_area);
         self.tree_area = tree_area;
@@ -672,14 +678,15 @@ impl App {
         }
         let title = Line::from(title_spans);
         let list = List::new(items)
-            .block(panel(title, self.focus == Focus::Tests))
+            .block(panel(title, self.focus == Focus::Tests).title_bottom(position(selected_index, rows.len())))
             .highlight_symbol(Span::styled("▌", Style::default().fg(ACCENT)))
             .highlight_spacing(HighlightSpacing::Always)
             .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        fill_viewport(&mut self.list, tree_area, rows.len());
         frame.render_stateful_widget(list, tree_area, &mut self.list);
 
-        let history_focused = self.focus == Focus::History;
-        let history_block = panel(Line::raw(" [2] History "), history_focused);
+        let history_block = panel(Line::raw(" [2] History "), history_focused)
+            .title_bottom(position(self.history_list.selected(), self.snapshot.history.len()));
         if self.snapshot.history.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::styled(" No runs yet", Style::default().fg(DIM))).block(history_block),
@@ -698,6 +705,7 @@ impl App {
                 .highlight_symbol(Span::styled(symbol, Style::default().fg(ACCENT)))
                 .highlight_spacing(HighlightSpacing::Always)
                 .highlight_style(highlight);
+            fill_viewport(&mut self.history_list, history_area, self.snapshot.history.len());
             frame.render_stateful_widget(list, history_area, &mut self.history_list);
         }
 
@@ -1116,7 +1124,7 @@ fn fold_offset(row: &Row) -> u16 {
     }
 }
 
-const HISTORY_ROWS: usize = 6;
+const HISTORY_COLLAPSED_ROWS: usize = 3;
 const DONATE_URL: &str = "https://github.com/sponsors/doominkim";
 const QUESTION_URL: &str = "https://github.com/doominkim/herdr-jest/issues";
 const ACCENT: Color = Color::Cyan;
@@ -1132,6 +1140,19 @@ fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .title(title.style(Style::default().add_modifier(Modifier::BOLD)))
+}
+
+fn fill_viewport(state: &mut ListState, area: Rect, len: usize) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_offset = len.saturating_sub(visible);
+    if state.offset() > max_offset {
+        *state.offset_mut() = max_offset;
+    }
+}
+
+fn position(selected: Option<usize>, len: usize) -> Line<'static> {
+    let current = if len == 0 { 0 } else { selected.unwrap_or(0).min(len - 1) + 1 };
+    Line::from(format!(" {current} of {len} ")).right_aligned()
 }
 
 fn justify(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
